@@ -10,8 +10,9 @@ automatically. The Logmast server is distributed separately.
 People can [start a trial in the console](https://app.logmast.com/signup).
 Agents should read the [versioned contract](docs/agents-v1.md), fetch the target
 installation's `/api/v1/catalog`, and use its advertised capabilities.
-Trial enrollment and verified claiming are available. Paid billing and expanded
-delegation are not available in this initial client release.
+Trial enrollment, verified claiming and owner-granted agent credentials are
+supported. Purchase availability depends on the installation's catalog; delegated
+payments are not yet available.
 
 Build the CLI with Rust 2024 support:
 
@@ -29,7 +30,11 @@ must be mode 0700 and its file mode 0600. It never prints stored credentials.
 it does not prove the user's application is instrumented.
 
 Use `logmastctl mcp` as a stdio MCP server with the same private state. It exposes
-catalog, workspace discovery and explicit verification tools. Install the
+catalog, workspace discovery, status, billing reads and explicit verification
+tools. An owner can grant a separate agent credential in the console; pass its
+private file with `--credential`. The `control` command writes management results
+to a new private output file because they can contain ingest credentials. See
+the agent contract for permissions and uncertain-result recovery. Install the
 `skills/logmast-onboard` directory in your agent's supported skill location.
 
 ## Rust reporting

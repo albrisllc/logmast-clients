@@ -12,6 +12,9 @@ canonical uncompressed events, and duplicates consume no allowance. The trial
 lasts 14 days with 100,000 events and 536,870,912 bytes and never automatically
 charges. Paid capabilities remain disabled until provider setup and verification
 are complete. Do not infer availability from a plan name or marketing page.
+Use `logmastctl schema` or `GET /openapi.json` for request schemas, permission
+requirements and retry semantics. The catalog's `capabilities` object explicitly
+marks delegated identities, checkout and unfinished lifecycle operations.
 
 ## Enroll and resume
 
@@ -79,8 +82,72 @@ them or infer spending permission from successful email delivery.
 Run `logmastctl mcp` with the same private state; it uses stdio JSON-RPC and
 advertises its tools with `tools/list`. Keep stdout reserved for protocol data.
 Only call the verification tool when the user authorized its synthetic event.
-The CLI is the complete enrollment entry point; the current MCP surface is
-catalog discovery, workspace listing and synthetic verification.
+The CLI is the complete enrollment entry point. MCP also provides workspace
+status and billing status reads. These reads never authorize or make a purchase.
+With a delegated credential, verification still requires the original enrollment
+state and its separately scoped ingest credential.
+
+## Continue with delegated authority
+
+After claiming, a human owner opens **Agents** in the console, chooses read-only
+or management access and an expiry of one to ninety days, and downloads a
+credential. Each grant creates a distinct agent principal. The owner can revoke
+it immediately. Agents cannot become owners, mint management credentials, or
+purchase coverage through these grants. An installation keeps at most one
+hundred grants per workspace, including revoked grants.
+
+Store the downloaded credential in a private directory, with directory mode
+0700 and file mode 0600. Its format is
+`{"version":1,"origin":"https://app.logmast.com","token":"<secret>"}`.
+The CLI refuses a different origin, a symlink or an accessible file. Do not
+paste the credential into a prompt or shell command.
+
+```sh
+logmastctl --credential /private/logmast/agent.json workspaces
+logmastctl --credential /private/logmast/agent.json status WORKSPACE_UUID
+logmastctl --credential /private/logmast/agent.json billing WORKSPACE_UUID
+logmastctl --credential /private/logmast/agent.json control WORKSPACE_UUID \
+  --command-file /private/logmast/create-service.json \
+  --output /private/logmast/create-service-result.json
+logmastctl --credential /private/logmast/agent.json mcp
+```
+
+For example, the command file can contain
+`{"action":"create_service","project_id":"PROJECT_UUID","name":"API"}`.
+The output can contain a service ingest credential and is therefore written to
+a new private file; stdout prints only its location. Inject that ingest secret
+into the application's secret manager. Never give the application management
+authority. `--credential` also accepts `LOGMAST_CREDENTIAL`.
+
+Control commands are **not generally idempotent**. The CLI makes one request.
+After an uncertain result, inspect workspace policies and service inventory
+before retrying creation or rotation. An empty output file means the result was
+not saved, not that the server rejected the operation. Choose a new output path
+only after reconciling that result. Enrollment and agent-grant creation have
+their own persisted operation identities and are safe to replay unchanged.
+
+For direct grant creation, generate and persist a random UUID and 32-byte
+lowercase hexadecimal secret before POSTing `/api/v1/workspaces/{workspace}/agents`.
+Keep the entire request, including expiry and ordered scopes, identical on retry.
+`read` is required; `manage` permits administration within the member role.
+Expiry must be in the future and at most ninety days away. Only a human owner
+session can create a grant. An accepted `billing` scope does
+not provide payment authority: purchases currently require a human owner.
+
+## Billing handoff and reconciliation
+
+Read `/api/v1/workspaces/{workspace}/billing` to inspect paid periods and recent
+purchase operations. When purchasable, an authenticated human owner can request
+checkout with a persisted UUID, plan/revision, `subscription` or `prepaid`, and
+one to twelve months (subscriptions require one). The same ID and intent return
+the same operation. The owner completes payment at the returned Stripe URL.
+Do not infer payment from the return URL: reconcile and inspect operation status.
+
+Provider-confirmed payment grants separate calendar-month allowances. Replayed
+callbacks do not reset usage. Cancellation stops subscription renewal and keeps
+already-paid coverage. A `review` state requires reconciliation or operator
+review; never create a replacement charge to bypass an uncertain purchase.
+Automated purchases using bounded mandates are not yet available.
 
 ## Failure handling
 

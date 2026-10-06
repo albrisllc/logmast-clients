@@ -24,6 +24,9 @@ struct Arguments {
     /// Private state file. Enrollment secrets are saved before network requests.
     #[arg(long,env="LOGMAST_STATE",default_value_os_t=default_state())]
     state: PathBuf,
+    /// Origin-bound agent credential JSON, downloaded by the workspace owner.
+    #[arg(long, env = "LOGMAST_CREDENTIAL")]
+    credential: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -31,6 +34,8 @@ struct Arguments {
 #[derive(Subcommand)]
 enum Command {
     Catalog,
+    /// Read the target installation's current OpenAPI contract without signing in.
+    Schema,
     Enroll {
         #[arg(long)]
         workspace: String,
@@ -49,6 +54,21 @@ enum Command {
         email: String,
     },
     Verify,
+    Billing {
+        workspace: Uuid,
+    },
+    Agents {
+        workspace: Uuid,
+    },
+    /// Send one management command. Save its result privately, including any
+    /// newly issued ingestion secret. Never automatically retries a mutation.
+    Control {
+        workspace: Uuid,
+        #[arg(long)]
+        command_file: PathBuf,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Start a stdio MCP server using this private enrollment state.
     Mcp,
 }
@@ -61,7 +81,7 @@ enum Error {
     InvalidState,
     #[error("HTTPS is required, except on loopback; URL must be an origin without credentials")]
     Origin,
-    #[error("transport unavailable; retry with the same state file")]
+    #[error("transport unavailable; outcome uncertain; follow the operation's recovery rules")]
     Transport(#[source] ureq::Error),
     #[error("Logmast returned HTTP {0}; credentials and response body suppressed")]
     Http(u16),
@@ -88,6 +108,14 @@ struct Saved {
     verification_batch: Uuid,
     verification_occurrence: Uuid,
     verification_time: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagementCredential {
+    version: u32,
+    origin: String,
+    token: String,
 }
 
 struct Client {
@@ -253,6 +281,32 @@ fn load(path: &PathBuf, origin: &str) -> Result<Saved, Error> {
     Ok(saved)
 }
 
+fn management_token(
+    path: &Option<PathBuf>,
+    state: &PathBuf,
+    origin: &str,
+) -> Result<String, Error> {
+    let Some(path) = path else {
+        return Ok(load(state, origin)?.bootstrap_secret);
+    };
+    let mut file = open_state(path, false)?;
+    let mut bytes = String::new();
+    file.read_to_string(&mut bytes).map_err(Error::State)?;
+    let credential: ManagementCredential =
+        serde_json::from_str(&bytes).map_err(|_| Error::InvalidState)?;
+    if credential.version != 1
+        || credential.origin != origin
+        || credential.token.len() != 64
+        || !credential
+            .token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return Err(Error::InvalidState);
+    }
+    Ok(credential.token)
+}
+
 fn prepare(
     path: &PathBuf,
     origin: &str,
@@ -297,6 +351,7 @@ fn execute(arguments: Arguments) -> Result<Value, Error> {
     let client = Client::new(&arguments.url)?;
     match arguments.command {
         Command::Catalog => client.call("/api/v1/catalog", None, None),
+        Command::Schema => client.call("/openapi.json", None, None),
         Command::Enroll {
             workspace,
             project,
@@ -309,33 +364,78 @@ fn execute(arguments: Arguments) -> Result<Value, Error> {
             service,
         )?),
         command => {
-            let saved = load(&arguments.state, &client.origin)?;
+            let token = management_token(&arguments.credential, &arguments.state, &client.origin)?;
             match command {
-                Command::Workspaces => {
-                    client.call("/api/v1/workspaces", Some(&saved.bootstrap_secret), None)
-                }
+                Command::Workspaces => client.call("/api/v1/workspaces", Some(&token), None),
                 Command::Status { workspace } => client.call(
                     &format!("/api/v1/workspaces/{workspace}/enrollment"),
-                    Some(&saved.bootstrap_secret),
+                    Some(&token),
                     None,
                 ),
                 Command::Claim { workspace, email } => client.call(
                     &format!("/api/v1/workspaces/{workspace}/claim"),
-                    Some(&saved.bootstrap_secret),
+                    Some(&token),
                     Some(json!({"email":email})),
                 ),
-                Command::Verify => client.verify(&saved),
+                Command::Verify => client.verify(&load(&arguments.state, &client.origin)?),
+                Command::Billing { workspace } => client.call(
+                    &format!("/api/v1/workspaces/{workspace}/billing"),
+                    Some(&token),
+                    None,
+                ),
+                Command::Agents { workspace } => client.call(
+                    &format!("/api/v1/workspaces/{workspace}/agents"),
+                    Some(&token),
+                    None,
+                ),
+                Command::Control {
+                    workspace,
+                    command_file,
+                    output,
+                } => {
+                    let mut bytes = Vec::new();
+                    File::open(command_file)
+                        .map_err(Error::State)?
+                        .take(32769)
+                        .read_to_end(&mut bytes)
+                        .map_err(Error::State)?;
+                    if bytes.len() > 32768 {
+                        return Err(Error::InvalidState);
+                    }
+                    let command: Value =
+                        serde_json::from_slice(&bytes).map_err(|_| Error::InvalidState)?;
+                    // Reserve a safe output before the mutation. A transport
+                    // failure leaves it empty: inspect workspace state before
+                    // deciding whether the command should be submitted again.
+                    let mut file = open_state(&output, true)?;
+                    let result = client.call(
+                        &format!("/api/v1/workspaces/{workspace}/control"),
+                        Some(&token),
+                        Some(command),
+                    )?;
+                    file.write_all(result.to_string().as_bytes())
+                        .map_err(Error::State)?;
+                    file.sync_all().map_err(Error::State)?;
+                    Ok(json!({"version":1,"saved_to":output,"secrets_printed":false}))
+                }
                 Command::Mcp => {
-                    mcp(&client, &saved)?;
+                    let saved = if arguments.credential.is_none() {
+                        Some(load(&arguments.state, &client.origin)?)
+                    } else {
+                        None
+                    };
+                    mcp(&client, &token, saved.as_ref())?;
                     Ok(Value::Null)
                 }
-                Command::Catalog | Command::Enroll { .. } => Err(Error::InvalidState),
+                Command::Catalog | Command::Schema | Command::Enroll { .. } => {
+                    Err(Error::InvalidState)
+                }
             }
         }
     }
 }
 
-fn mcp(client: &Client, saved: &Saved) -> Result<(), Error> {
+fn mcp(client: &Client, token: &str, saved: Option<&Saved>) -> Result<(), Error> {
     use std::io::BufRead;
     let mut input = std::io::stdin().lock();
     loop {
@@ -363,15 +463,41 @@ fn mcp(client: &Client, saved: &Saved) -> Result<(), Error> {
             Some("tools/list") => Ok(json!({"tools":[
                 {"name":"logmast_catalog","description":"Read current allowances and available capabilities","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true}},
                 {"name":"logmast_workspaces","description":"List authorized workspaces","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":true}},
-                {"name":"logmast_verify","description":"Submit one persisted synthetic verification event and verify evidence readback; requires user authorization to send it","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"idempotentHint":true}}
+                {"name":"logmast_verify","description":"Submit one persisted synthetic verification event and verify evidence readback; requires enrollment state and user authorization to send it","inputSchema":{"type":"object","properties":{},"additionalProperties":false},"annotations":{"readOnlyHint":false,"idempotentHint":true}},
+                {"name":"logmast_status","description":"Read a workspace's enrollment and collection status","inputSchema":{"type":"object","properties":{"workspace":{"type":"string","format":"uuid"}},"required":["workspace"],"additionalProperties":false},"annotations":{"readOnlyHint":true}},
+                {"name":"logmast_billing","description":"Read paid coverage and purchase status; never makes a purchase","inputSchema":{"type":"object","properties":{"workspace":{"type":"string","format":"uuid"}},"required":["workspace"],"additionalProperties":false},"annotations":{"readOnlyHint":true}}
             ]})),
             Some("tools/call") => {
                 let value = match request.pointer("/params/name").and_then(Value::as_str) {
                     Some("logmast_catalog") => client.call("/api/v1/catalog", None, None),
                     Some("logmast_workspaces") => {
-                        client.call("/api/v1/workspaces", Some(&saved.bootstrap_secret), None)
+                        client.call("/api/v1/workspaces", Some(token), None)
                     }
-                    Some("logmast_verify") => client.verify(saved),
+                    Some("logmast_verify") => match saved {
+                        Some(saved) => client.verify(saved),
+                        None => Err(Error::InvalidState),
+                    },
+                    Some(name @ ("logmast_status" | "logmast_billing")) => {
+                        match request
+                            .pointer("/params/arguments/workspace")
+                            .and_then(Value::as_str)
+                            .and_then(|id| Uuid::parse_str(id).ok())
+                        {
+                            Some(workspace) => client.call(
+                                &format!(
+                                    "/api/v1/workspaces/{workspace}/{}",
+                                    if name == "logmast_status" {
+                                        "enrollment"
+                                    } else {
+                                        "billing"
+                                    }
+                                ),
+                                Some(token),
+                                None,
+                            ),
+                            None => Err(Error::Mcp),
+                        }
+                    }
                     _ => Err(Error::Mcp),
                 };
                 Ok(match value {
@@ -477,6 +603,32 @@ mod tests {
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))?;
         assert!(load(&path, "https://app.logmast.com").is_err());
+        fs::remove_dir_all(directory)?;
+        Ok(())
+    }
+
+    #[test]
+    fn delegated_credentials_are_origin_bound_and_strict() -> anyhow::Result<()> {
+        let directory = std::env::temp_dir().join(format!("logmast-cli-{}", Uuid::now_v7()));
+        let path = directory.join("agent.json");
+        let origin = "https://app.logmast.com";
+        let token = secret();
+        let mut file = open_state(&path, true)?;
+        serde_json::to_writer(
+            &mut file,
+            &json!({"version":1,"origin":origin,"token":token}),
+        )?;
+        file.sync_all()?;
+        assert!(management_token(&Some(path.clone()), &path, origin)? == token);
+        assert!(management_token(&Some(path.clone()), &path, "https://other.example").is_err());
+        for invalid in [
+            json!({"version":2,"origin":origin,"token":token}),
+            json!({"version":1,"origin":origin,"token":"not-a-credential"}),
+            json!({"version":1,"origin":origin,"token":token,"extra":true}),
+        ] {
+            fs::write(&path, serde_json::to_vec(&invalid)?)?;
+            assert!(management_token(&Some(path.clone()), &path, origin).is_err());
+        }
         fs::remove_dir_all(directory)?;
         Ok(())
     }
