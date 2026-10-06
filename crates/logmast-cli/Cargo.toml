@@ -1,0 +1,25 @@
+[package]
+name = "logmast-cli"
+version.workspace = true
+edition.workspace = true
+license = "Apache-2.0"
+description = "Logmast management CLI and stdio MCP adapter; API-only collection"
+publish = false
+[[bin]]
+name = "logmastctl"
+path = "src/main.rs"
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+thiserror.workspace = true
+clap = { version = "4.5.60", features = ["derive", "env"] }
+rand = "0.8.5"
+hex.workspace = true
+ureq = { version = "3.4.1", features = ["json"] }
+url = "2.5.8"
+libc = "0.2.189"
+[lints]
+workspace = true
