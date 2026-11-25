@@ -1,5 +1,13 @@
 //! Bounded, in-memory tracing export. Configure once in each executable.
 //! Abrupt termination can lose queued reports. Exporter diagnostics stay local.
+//! Check-ins (heartbeats, job completions, verifications) are sent directly
+//! through [`CheckIns`].
+
+mod check_in;
+pub use check_in::{
+    CheckInError, CheckInReport, CheckIns, SEND_BUDGET as CHECK_IN_SEND_BUDGET, stable_run_id,
+};
+pub use logmast_wire::{CheckAcceptance, CheckOutcome};
 
 /// Own the report for an unexpected Tokio task termination. Await the handle
 /// exactly here; callers must not report the returned JoinError again. Planned
@@ -58,7 +66,7 @@ pub fn report_safe_failure(
     tracing::error!(target:"logmast::report",code,operation,cause_discriminator,exception_chain,correlation_id=correlation_id.unwrap_or(""),outcome="failed",message);
 }
 use chrono::Utc;
-use logmast_wire::{Batch, ErrorResponse, Event, Exception, Outcome, Severity};
+use logmast_wire::{Acceptance, Batch, ErrorResponse, Event, Exception, Outcome, Severity};
 use serde_json::Value;
 use std::{
     collections::BTreeMap,
@@ -83,7 +91,9 @@ use uuid::Uuid;
 const QUEUE_EVENTS: usize = 1024;
 const QUEUE_BYTES: usize = 16 * 1024 * 1024;
 const FLUSH_BYTES: usize = 512 * 1024;
+const MAX_RESPONSE_BYTES: usize = 16 * 1024;
 const RETRY_LIFETIME: Duration = Duration::from_secs(15 * 60);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Config {
     pub endpoint: String,
@@ -105,8 +115,10 @@ pub enum ReportingError {
 
 impl Config {
     pub fn from_env() -> Result<Option<Self>, ReportingError> {
-        let Ok(endpoint) = std::env::var("LOGMAST_ENDPOINT") else {
-            return Ok(None);
+        let endpoint = match std::env::var("LOGMAST_ENDPOINT") {
+            Ok(endpoint) => endpoint,
+            Err(std::env::VarError::NotPresent) => return Ok(None),
+            Err(std::env::VarError::NotUnicode(_)) => return Err(ReportingError::Configuration),
         };
         let token = std::env::var("LOGMAST_TOKEN").map_err(|_| ReportingError::Configuration)?;
         let service_id = std::env::var("LOGMAST_SERVICE_ID")
@@ -190,7 +202,7 @@ impl ReportingGuard {
     pub async fn shutdown(mut self) -> Result<BTreeMap<String, u64>, ReportingError> {
         let _ = self.shutdown.send(true);
         if let Some(mut task) = self.task.take() {
-            if let Ok(result) = tokio::time::timeout(Duration::from_secs(10), &mut task).await {
+            if let Ok(result) = tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut task).await {
                 result?;
             } else {
                 self.counters.dropped_shutdown.fetch_add(
@@ -453,6 +465,7 @@ async fn export(
     mut shutdown: watch::Receiver<bool>,
     counters: Arc<Counters>,
 ) {
+    let gzip_enabled = supports_gzip(&config, &client).await;
     let mut carry = None;
     loop {
         if *shutdown.borrow() {
@@ -485,7 +498,7 @@ async fn export(
             bytes += next.bytes + 1;
             pending.push(next);
         }
-        deliver(&config, &client, pending, &counters).await;
+        deliver(&config, &client, pending, &counters, gzip_enabled).await;
     }
 }
 
@@ -494,6 +507,7 @@ async fn deliver(
     client: &reqwest::Client,
     pending: Vec<QueuedEvent>,
     counters: &Counters,
+    gzip_enabled: bool,
 ) {
     let mut batches = vec![pending];
     while let Some(mut pending) = batches.pop() {
@@ -519,6 +533,7 @@ async fn deliver(
             continue;
         };
         let mut attempt = 0u32;
+        let mut compressed = if gzip_enabled { gzip_body(&body) } else { None };
         loop {
             if pending
                 .iter()
@@ -533,17 +548,25 @@ async fn deliver(
                 .post(&config.endpoint)
                 .bearer_auth(&config.token)
                 .header("content-type", "application/json")
-                .body(body.clone())
+                .header(
+                    "content-encoding",
+                    if compressed.is_some() {
+                        "gzip"
+                    } else {
+                        "identity"
+                    },
+                )
+                .body(compressed.as_ref().unwrap_or(&body).clone())
                 .send()
                 .await;
             let mut retry_after = None;
             if let Ok(response) = response {
                 let status = response.status();
-                if status.is_success() {
-                    counters
-                        .delivered
-                        .fetch_add(pending.len() as u64, Ordering::Relaxed);
-                    break;
+                // A rolling deployment can advertise gzip before every replica
+                // understands it. Retry plain JSON with the same identities.
+                if status.as_u16() == 415 && compressed.is_some() {
+                    compressed = None;
+                    continue;
                 }
                 retry_after = response
                     .headers()
@@ -551,9 +574,35 @@ async fn deliver(
                     .and_then(|header| header.to_str().ok())
                     .and_then(|text| text.parse::<u64>().ok())
                     .map(|seconds| seconds.min(60));
-                if matches!(status.as_u16(), 409 | 413 | 422) {
+                if status.is_success() {
+                    let acceptance = read_response(response)
+                        .await
+                        .and_then(|body| serde_json::from_slice::<Acceptance>(&body).ok());
+                    let counted_only = acceptance.as_ref().and_then(|acceptance| {
+                        acceptance
+                            .stored_events
+                            .and_then(|stored| acceptance.new_events.checked_sub(stored))
+                    });
+                    if acceptance.is_some_and(|acceptance| {
+                        !acceptance.receipt_id.is_nil()
+                            && acceptance.new_events.checked_add(acceptance.duplicates)
+                                == Some(pending.len())
+                    }) {
+                        if counted_only.is_some_and(|counted| counted > 0) {
+                            tracing::warn!(target:"logmast_exporter",counted=counted_only,"Logmast balance has run out; events were counted but not stored. Add credit to resume storing them");
+                        }
+                        counters
+                            .delivered
+                            .fetch_add(pending.len() as u64, Ordering::Relaxed);
+                        break;
+                    }
+                    // An uncertain acknowledgment can follow a committed write.
+                    // Retry the unchanged serialized batch so Logmast deduplicates it.
+                    tracing::warn!(target:"logmast_exporter",status=status.as_u16(),events=pending.len(),"Logmast returned an invalid acceptance; retrying batch");
+                } else if matches!(status.as_u16(), 409 | 413 | 422) {
                     if status.as_u16() == 422
-                        && let Ok(errors) = response.json::<ErrorResponse>().await
+                        && let Some(body) = read_response(response).await
+                        && let Ok(errors) = serde_json::from_slice::<ErrorResponse>(&body)
                     {
                         let invalid: std::collections::BTreeSet<usize> = errors
                             .errors
@@ -587,12 +636,15 @@ async fn deliver(
                         counters.dropped_invalid.fetch_add(1, Ordering::Relaxed);
                     }
                     break;
-                }
-                if status.is_client_error() && status.as_u16() != 429 {
+                } else if status.is_client_error() && status.as_u16() != 429 {
                     counters
                         .dropped_invalid
                         .fetch_add(pending.len() as u64, Ordering::Relaxed);
-                    tracing::warn!(target:"logmast_exporter",status=status.as_u16(),dropped=pending.len(),"Logmast rejected a batch permanently; check credentials and service configuration");
+                    if status.as_u16() == 402 {
+                        tracing::warn!(target:"logmast_exporter",status=status.as_u16(),dropped=pending.len(),"Logmast allowance used up; batch dropped. Claim an unverified workspace with a verified email, or renew its coverage");
+                    } else {
+                        tracing::warn!(target:"logmast_exporter",status=status.as_u16(),dropped=pending.len(),"Logmast rejected a batch permanently; check credentials and service configuration");
+                    }
                     break;
                 }
             }
@@ -607,6 +659,66 @@ async fn deliver(
             .await;
         }
     }
+}
+
+async fn supports_gzip(config: &Config, client: &reqwest::Client) -> bool {
+    let Some(url) = reqwest::Url::parse(&config.endpoint)
+        .ok()
+        .and_then(|url| url.join("/api/v1/catalog").ok())
+    else {
+        return false;
+    };
+    let Ok(response) = client.get(url).timeout(Duration::from_secs(2)).send().await else {
+        return false;
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+    let Some(body) = read_response(response).await else {
+        return false;
+    };
+    let Ok(catalog) = serde_json::from_slice::<Value>(&body) else {
+        return false;
+    };
+    catalog
+        .pointer("/ingestion/content_encodings")
+        .and_then(Value::as_array)
+        .is_some_and(|encodings| {
+            encodings
+                .iter()
+                .any(|encoding| encoding.as_str() == Some("gzip"))
+        })
+}
+
+fn gzip_body(body: &[u8]) -> Option<Vec<u8>> {
+    use std::io::Write;
+    if body.len() < 1024 {
+        return None;
+    }
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    encoder.write_all(body).ok()?;
+    let compressed = encoder.finish().ok()?;
+    (compressed.len() < body.len()).then_some(compressed)
+}
+
+/// Bound both acceptance and validation-error reads, including chunked bodies
+/// without Content-Length. Transport errors and oversized bodies are untrusted
+/// responses; neither their contents nor the request URL belong in diagnostics.
+async fn read_response(mut response: reqwest::Response) -> Option<Vec<u8>> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_RESPONSE_BYTES as u64)
+    {
+        return None;
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.ok()? {
+        if chunk.len() > MAX_RESPONSE_BYTES - body.len() {
+            return None;
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Some(body)
 }
 
 /// Emit a terminal failure once. Every Display/source in `error` must already

@@ -1,7 +1,7 @@
 # Logmast clients
 
 Apache-2.0 clients for [Logmast](https://www.logmast.com): a Rust reporting SDK,
-management CLI, stdio MCP adapter and agent onboarding skill. Collection is
+management CLI and agent onboarding skill. Collection is
 API-only. These tools do not tail files, install a host agent or capture logs
 automatically. The Logmast server is distributed separately.
 
@@ -26,13 +26,16 @@ logmastctl verify
 `logmastctl` persists random identities and secrets before enrollment, so retry
 with the same private state file after uncertain delivery. Its state directory
 must be mode 0700 and its file mode 0600. It never prints stored credentials.
-`verify` sends an explicit synthetic failure and checks the receipt and readback;
-it does not prove the user's application is instrumented.
+`verify` sends an explicit synthetic failure and checks the receipt and readback.
+An interrupted run resumes unchanged; after completion the next invocation is
+fresh. `verify --run-id UUID` reuses one persisted run and labels completed proof
+as historical. These tests
+do not prove the user's application is instrumented or an email reached an inbox.
 
-Use `logmastctl mcp` as a stdio MCP server with the same private state. It exposes
-catalog, workspace discovery, status, billing reads and explicit verification
-tools. An owner can grant a separate agent credential in the console; pass its
-private file with `--credential`. The `control` command writes management results
+An owner can grant a separate agent credential in the console; pass its
+private file with `--credential`. `setup` binds a repository to a workspace and
+project; `services create`, `credentials rotate|export` and `verify --service` keep
+ingest credentials private on the machine. The `control` command writes management results
 to a new private output file because they can contain ingest credentials. See
 the agent contract for permissions and uncertain-result recovery. Install the
 `skills/logmast-onboard` directory in your agent's supported skill location.
@@ -52,10 +55,20 @@ operation boundary with a stable code, safe cause, and correlation ID. Ordinary
 logs and exporter errors stay local. Never export raw credentials, request
 bodies or unrestricted database/provider errors.
 
-The exporter has bounded count/byte queues and retries with stable event
-identities. It is an in-memory queue, not a durable spool: abrupt termination,
+The exporter batches at 100 events, 512 KiB, or one second. It discovers gzip
+support, compresses useful bodies once per batch, and preserves their identities
+on retries and plain-JSON fallback. Delivery requires a valid non-nil receipt
+and matching counts; response reads are bounded to 16 KiB. It has bounded
+count/byte queues and retries with stable event identities. It is an in-memory
+queue, not a durable spool: abrupt termination,
 overflow, permanent rejection or exhausted retries can lose reports. Inspect
 its counters and verify a real application failure through the read API.
+
+Read the [developer guides](https://www.logmast.com/docs/) or the separate
+[agent documentation](https://www.logmast.com/docs/agents/). Heartbeats, job
+completion, and application-owned verification use the check-in API. Send them
+with `CheckIns::new(&config)` and `send(&CheckInReport)`; the SDK does not invent
+those signals from ordinary logs.
 
 ## Verification
 

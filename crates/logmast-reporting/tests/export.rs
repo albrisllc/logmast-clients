@@ -10,6 +10,14 @@ use logmast_wire::{Batch, Event, Severity};
 use std::{collections::BTreeMap, sync::Arc};
 use tokio::sync::Mutex;
 
+fn acceptance(batch: &Batch) -> serde_json::Value {
+    serde_json::json!({
+        "receipt_id": uuid::Uuid::now_v7(),
+        "new_events": batch.events.len(),
+        "duplicates": 0,
+    })
+}
+
 fn event(message: &str) -> Event {
     Event {
         occurrence_id: uuid::Uuid::now_v7(),
@@ -31,6 +39,126 @@ fn event(message: &str) -> Event {
     }
 }
 
+#[tokio::test]
+async fn advertised_gzip_batches_and_preserves_wire_bytes_across_retry() {
+    compression_fixture(false).await;
+}
+
+#[tokio::test]
+async fn unsupported_gzip_falls_back_without_changing_logical_identity() {
+    compression_fixture(true).await;
+}
+
+async fn compression_fixture(fallback: bool) {
+    use axum::{body::Bytes, http::HeaderMap, routing::get};
+    use std::io::Read;
+    type Attempts = Arc<Mutex<Vec<(String, Vec<u8>, Batch)>>>;
+    #[derive(Clone)]
+    struct Capture {
+        fallback: bool,
+        calls: Attempts,
+    }
+    async fn collect(
+        State(capture): State<Capture>,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let encoding = headers
+            .get("content-encoding")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let mut decoded = Vec::new();
+        if encoding == "gzip" {
+            flate2::read::GzDecoder::new(body.as_ref())
+                .read_to_end(&mut decoded)
+                .unwrap();
+        } else {
+            decoded = body.to_vec();
+        }
+        let batch: Batch = serde_json::from_slice(&decoded).unwrap();
+        let accepted = acceptance(&batch);
+        let mut calls = capture.calls.lock().await;
+        calls.push((encoding, body.to_vec(), batch));
+        let status = if calls.len() == 1 {
+            if capture.fallback {
+                StatusCode::UNSUPPORTED_MEDIA_TYPE
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
+            }
+        } else {
+            StatusCode::OK
+        };
+        (status, Json(accepted))
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let catalog_reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reads = catalog_reads.clone();
+    let router = Router::new()
+        .route("/ingest", post(collect))
+        .route(
+            "/api/v1/catalog",
+            get(move |headers: HeaderMap| {
+                assert!(!headers.contains_key("authorization"));
+                reads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                async {
+                    Json(serde_json::json!({"ingestion":{"content_encodings":["identity","gzip"]}}))
+                }
+            }),
+        )
+        .with_state(Capture {
+            fallback,
+            calls: calls.clone(),
+        });
+    let server = tokio::spawn(async move {
+        axum::serve(listener, router).await.unwrap();
+    });
+    let (layer, guard) = start(Config {
+        endpoint: format!("http://{address}/ingest"),
+        token: "fixture".into(),
+        service_id: uuid::Uuid::now_v7(),
+        environment: "test".into(),
+        release: None,
+    })
+    .unwrap();
+    let reports: Vec<_> = (0..10)
+        .map(|_| event(&"repeated safe diagnostic ".repeat(120)))
+        .collect();
+    let ids: Vec<_> = reports.iter().map(|report| report.occurrence_id).collect();
+    for report in reports {
+        layer.enqueue(report);
+    }
+    assert_eq!(guard.shutdown().await.unwrap()["delivered"], 10);
+    let calls = calls.lock().await;
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].0, "gzip");
+    assert_eq!(
+        calls[0]
+            .2
+            .events
+            .iter()
+            .map(|event| event.occurrence_id)
+            .collect::<Vec<_>>(),
+        ids
+    );
+    assert!(calls[0].1.len() < serde_json::to_vec(&calls[0].2).unwrap().len() / 2);
+    assert_eq!(
+        serde_json::to_vec(&calls[0].2).unwrap(),
+        serde_json::to_vec(&calls[1].2).unwrap()
+    );
+    if fallback {
+        assert_eq!(calls[1].0, "identity");
+    } else {
+        assert_eq!(calls[0].1, calls[1].1);
+    }
+    assert_eq!(catalog_reads.load(std::sync::atomic::Ordering::Relaxed), 1);
+    server.abort();
+    let _ = server.await;
+}
+
 async fn reject_one(
     State(batches): State<Arc<Mutex<Vec<Batch>>>>,
     Json(batch): Json<Batch>,
@@ -39,6 +167,7 @@ async fn reject_one(
         .events
         .iter()
         .position(|event| event.message == "invalid");
+    let accepted = acceptance(&batch);
     batches.lock().await.push(batch);
     if let Some(index) = invalid {
         return (
@@ -48,7 +177,7 @@ async fn reject_one(
             ),
         );
     }
-    (StatusCode::OK, Json(serde_json::json!({"ok":true})))
+    (StatusCode::OK, Json(accepted))
 }
 
 #[tokio::test]
@@ -174,6 +303,7 @@ async fn transient_failure_retries_identical_batch_and_occurrences() {
         Json(batch): Json<Batch>,
     ) -> (StatusCode, Json<serde_json::Value>) {
         let mut batches = batches.lock().await;
+        let accepted = acceptance(&batch);
         batches.push(batch);
         (
             if batches.len() == 1 {
@@ -181,7 +311,7 @@ async fn transient_failure_retries_identical_batch_and_occurrences() {
             } else {
                 StatusCode::OK
             },
-            Json(serde_json::json!({})),
+            Json(accepted),
         )
     }
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -259,4 +389,158 @@ async fn event_fields_outrank_enclosing_span_context() {
     assert_eq!(exported.attributes.get("f00"), Some(&serde_json::json!(0)));
     server.abort();
     let _ = server.await;
+}
+
+struct ResponseFixture {
+    status: StatusCode,
+    body: String,
+    stall_after_body: bool,
+    batches: Mutex<Vec<Batch>>,
+}
+
+async fn fixture_response(
+    State(fixture): State<Arc<ResponseFixture>>,
+    Json(batch): Json<Batch>,
+) -> axum::response::Response {
+    use axum::{body::Body, response::IntoResponse};
+    use futures_util::StreamExt;
+    let accepted = acceptance(&batch);
+    let mut batches = fixture.batches.lock().await;
+    batches.push(batch);
+    if batches.len() > 1 {
+        return Json(accepted).into_response();
+    }
+    let body = if fixture.stall_after_body {
+        // No Content-Length and no EOF: the exporter must stop reading at its
+        // byte limit, without waiting for the eight-second request timeout.
+        let chunks = futures_util::stream::iter([Ok::<_, std::io::Error>(fixture.body.clone())]);
+        Body::from_stream(chunks.chain(futures_util::stream::pending()))
+    } else {
+        Body::from(fixture.body.clone())
+    };
+    (fixture.status, body).into_response()
+}
+
+async fn run_response_fixture(
+    status: StatusCode,
+    body: String,
+    stall_after_body: bool,
+) -> Vec<Batch> {
+    let fixture = Arc::new(ResponseFixture {
+        status,
+        body,
+        stall_after_body,
+        batches: Mutex::new(Vec::new()),
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = Router::new()
+        .route("/ingest", post(fixture_response))
+        .with_state(fixture.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let (layer, guard) = start(Config {
+        endpoint: format!("http://{address}/ingest"),
+        token: "private-fixture-token".into(),
+        service_id: uuid::Uuid::now_v7(),
+        environment: "test".into(),
+        release: None,
+    })
+    .unwrap();
+    layer.enqueue(event("first"));
+    layer.enqueue(event("second"));
+    let counters = tokio::time::timeout(std::time::Duration::from_secs(4), guard.shutdown())
+        .await
+        .expect("bounded response reader did not finish promptly")
+        .unwrap();
+    assert_eq!(counters["delivered"], 2);
+    assert_eq!(counters["dropped_invalid"], 0);
+    assert_eq!(counters["dropped_shutdown"], 0);
+    server.abort();
+    let _ = server.await;
+    fixture.batches.lock().await.clone()
+}
+
+#[tokio::test]
+async fn valid_receipts_accept_new_duplicate_and_mixed_counts() {
+    for (new_events, duplicates) in [(2, 0), (0, 2), (1, 1)] {
+        let body = serde_json::json!({
+            "receipt_id": uuid::Uuid::now_v7(),
+            "new_events": new_events,
+            "duplicates": duplicates,
+        });
+        let batches = run_response_fixture(StatusCode::OK, body.to_string(), false).await;
+        assert_eq!(batches.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn invalid_acceptance_retries_identical_batch_and_occurrences() {
+    let receipt_id = uuid::Uuid::now_v7();
+    let invalid_bodies = [
+        String::new(),
+        String::from("<html>proxy success</html>"),
+        String::from("{}"),
+        serde_json::json!({"receipt_id": uuid::Uuid::nil(), "new_events": 2, "duplicates": 0})
+            .to_string(),
+        serde_json::json!({"receipt_id": "invalid", "new_events": 2, "duplicates": 0}).to_string(),
+        serde_json::json!({"receipt_id": receipt_id, "new_events": 2}).to_string(),
+        serde_json::json!({"receipt_id": receipt_id, "new_events": 1, "duplicates": 0}).to_string(),
+        serde_json::json!({"receipt_id": receipt_id, "new_events": 2, "duplicates": 1}).to_string(),
+        serde_json::json!({"receipt_id": receipt_id, "new_events": -1, "duplicates": 3})
+            .to_string(),
+        serde_json::json!({"receipt_id": receipt_id, "new_events": usize::MAX, "duplicates": 3})
+            .to_string(),
+    ];
+    for body in invalid_bodies {
+        let batches = run_response_fixture(StatusCode::OK, body.clone(), false).await;
+        assert_eq!(
+            batches.len(),
+            2,
+            "invalid acknowledgment was accepted: {body}"
+        );
+        assert_eq!(
+            serde_json::to_vec(&batches[0]).unwrap(),
+            serde_json::to_vec(&batches[1]).unwrap(),
+        );
+    }
+}
+
+#[tokio::test]
+async fn response_reads_are_bounded_with_and_without_content_length() {
+    let accepted = serde_json::json!({
+        "receipt_id": uuid::Uuid::now_v7(), "new_events": 2, "duplicates": 0,
+    })
+    .to_string();
+    let at_limit = format!("{accepted}{}", " ".repeat(16 * 1024 - accepted.len()));
+    assert_eq!(
+        run_response_fixture(StatusCode::OK, at_limit.clone(), false)
+            .await
+            .len(),
+        1,
+    );
+    for stall in [false, true] {
+        let batches = run_response_fixture(StatusCode::OK, format!("{at_limit} "), stall).await;
+        assert_eq!(batches.len(), 2);
+        assert_eq!(
+            serde_json::to_vec(&batches[0]).unwrap(),
+            serde_json::to_vec(&batches[1]).unwrap(),
+        );
+    }
+    let batches = run_response_fixture(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        " ".repeat(16 * 1024 + 1),
+        true,
+    )
+    .await;
+    // Unreadable validation details use the existing split policy.
+    assert_eq!(batches.len(), 3);
+    assert_ne!(batches[0].batch_id, batches[1].batch_id);
+    assert_eq!(
+        batches[0].events[0].occurrence_id,
+        batches[1].events[0].occurrence_id
+    );
+    assert_eq!(
+        batches[0].events[1].occurrence_id,
+        batches[2].events[0].occurrence_id
+    );
 }
