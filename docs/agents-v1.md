@@ -27,7 +27,7 @@ The binary is `target/release/logmastctl`. Linux/macOS are supported.
 
 ```sh
 logmastctl catalog
-logmastctl enroll --workspace 'My team' --project Production --service ledgercore
+logmastctl enroll --workspace 'My team' --project Production --service api
 logmastctl verify
 logmastctl workspaces
 logmastctl status WORKSPACE_UUID
